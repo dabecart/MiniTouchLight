@@ -3,94 +3,82 @@
 
 #define MAX_ARRAY_COUNT 10
 #define SENSING_TIMEOUT 20 // ms
-#define SLOPE_ADD_POINT_TIMEOUT 1 // * SENSING_TIMEOUT
+// The value for the HIGH signal may vary on the long term, so the HIGH threshold is updated
+// by using the sensorMax value times this define value.
+#define HIGH_SENSOR_MULTIPLE 2 
 
-#define CALIBRATION_INTERVAL 5000 // ms
+#define CALIBRATION_INTERVAL 1000 // ms
 #define CALIBRATION_DURATION 2000 // ms
-
+// If in this period of time the calibration couldn't happen, force a recalibration.
+#define FORCE_CALIBRATION_TIME 10000 // ms
+#define LONG_CLICK_DURATION 1500 // ms
+#define RELEASE_DURATION 400 // ms
 #define AUTO_TURN_OFF_TIMEOUT 60000
 
-#define LOWER_SENSOR_MAX_SLOPE 100
+long lastSwitchTime = 0;
+long lastCalibrationTime = 0;
+long lastReleasingTime = 0;
+bool clicking = false, releasing = false;
 
-CapacitiveSensor capSensor = CapacitiveSensor(4, 2);
-
-const int ledPin = 9;
-
-long lastSwitch = 0;
-long lastCalibration = 0;
-bool clicking = false;
-
-bool ledOn = false;
 #define MAX_LED_MODES 3
-typedef enum{
-  STATIC = 0, SINE_FAST = 1, SINE_SLOW = 2
-}LedMode;
-LedMode ledMode = STATIC;
+#define LED_STATIC  0
+#define LED_SINE_FAST 1
+#define LED_SINE_SLOW  2
+long nextAnimationTime = 0;
+uint8_t ledMode = LED_STATIC;
+uint8_t animationIndex = 0;
+bool ledOn = false;
 bool changeModeNow = false;
 
 long sensorValue = 0;
-long sensorMax = 0, sensorMaxSlope = 0;
-double alpha = 0.005;
+long sensorMax = 0; // Sensor low value (while not pressed).
+long sensorHighValue = 1000;
 
-double sensorSlope = 0;
 uint8_t sensorIndex = 0;
-uint32_t sensorArray[MAX_ARRAY_COUNT];
+uint32_t *sensorArray = new uint32_t[MAX_ARRAY_COUNT];
+
+const int ledPin = 0;
+CapacitiveSensor capSensor = CapacitiveSensor(4, 2);
 
 long measureSensor(){
-  // Counts the numbers of times this function has been called. When it reaches the threshold 
-  // SLOPE_ADD_POINT_TIMEOUT it calculates the slope of the curve.
-  static uint8_t inputToArrayCount = 0;
   long read = capSensor.capacitiveSensor(5)*1000;
   
   // Reset the sensor (it seems to get rid of some minor noise)
   digitalWrite(4, LOW);
 
-  Serial.print(">raw:");
-  Serial.println(read);
+  // Serial.print(">raw:");
+  // Serial.println(read);
 
-  if(sensorMax != 0 && read > 10*sensorMax) read = 10*sensorMax;
-  if(sensorValue == 0) sensorValue = read;
-  // LP Filter. 
-  sensorValue = read*alpha + sensorValue*(1.0-alpha);
-  // sensorValue = read; // TEMPORARY!
+  if(sensorMax != 0 && read > 10*sensorMax) read = 10*sensorMax; // Reduce noise spikes.
+  sensorValue = read; // Maybe it could be pre-filtered a bit more?
 
-  inputToArrayCount++;
-  if(inputToArrayCount == SLOPE_ADD_POINT_TIMEOUT){
-    inputToArrayCount = 0;
-    sensorArray[sensorIndex++] = sensorValue;
+  // Store in array.
+  sensorArray[sensorIndex++] = sensorValue;
 
-    static bool enoughPoints = false;
-    if(enoughPoints){
-      sensorIndex %= MAX_ARRAY_COUNT;
-    
-      // Calculate regression slope.
-      double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x_squared = 0;
-      int pointer = sensorIndex;
+  static bool enoughPoints = false;
+  if(enoughPoints){
+    sensorIndex %= MAX_ARRAY_COUNT;
+  
+    // Calculate the average inside the circular buffer.
+    double sum = 0;
+    int pointer = sensorIndex;
 
-      for (int i = 0; i < MAX_ARRAY_COUNT; ++i) {
-          double x = i*SENSING_TIMEOUT*SLOPE_ADD_POINT_TIMEOUT/1000.0;
-          sum_x += x;
-          sum_y += sensorArray[pointer];
-          sum_xy += x * sensorArray[pointer];
-          sum_x_squared += x * x;
+    for (int i = 0; i < MAX_ARRAY_COUNT; ++i) {
+        sum += sensorArray[pointer];
 
-          pointer++;
-          pointer %= MAX_ARRAY_COUNT;
-      }
-
-      sensorSlope = (MAX_ARRAY_COUNT * sum_xy - sum_x * sum_y) / (MAX_ARRAY_COUNT * sum_x_squared - sum_x * sum_x);
-      // sensorValue = sum_y/MAX_ARRAY_COUNT;
-    }else{
-      enoughPoints = sensorIndex==MAX_ARRAY_COUNT;
+        pointer++;
+        pointer %= MAX_ARRAY_COUNT;
     }
-
+    sensorValue = sum/MAX_ARRAY_COUNT;
+  }else{
+    enoughPoints = sensorIndex==MAX_ARRAY_COUNT;
   }
   delay(SENSING_TIMEOUT);
   return sensorValue;
 }
 
 void calibrateSensor(){
-  Serial.println("Calibrating...");
+  // Serial.println("Calibrating...");
   long startTime = millis();
   sensorMax = 0;
   while(millis()-startTime < 5000){
@@ -98,46 +86,44 @@ void calibrateSensor(){
     if(sensorValue > sensorMax){
       sensorMax = sensorValue;
     }
-    if(sensorSlope > sensorMaxSlope){
-      sensorMaxSlope = sensorSlope;
-    }
-    delay(20); // 20 more to compensate
   }
-
-  if(sensorMaxSlope < LOWER_SENSOR_MAX_SLOPE){
-    sensorMaxSlope = LOWER_SENSOR_MAX_SLOPE;
-  }
+  if(sensorMax==0) sensorMax = 1;
+  sensorHighValue = HIGH_SENSOR_MULTIPLE*sensorMax;
 }
 
-void (* resetFunc) (void) = 0;
-
 void setup() {
-  Serial.begin(9600);
+  // Serial.begin(9600);
+  digitalWrite(ledPin, LOW);
   pinMode(ledPin, OUTPUT);
 
   for(int i = 0; i < MAX_ARRAY_COUNT; i++) sensorArray[i] = -1;
 
   calibrateSensor();
+
+  // Show mini animation that everything is ready.
+  for(uint8_t i = 0; i < 3; i++){
+    digitalWrite(ledPin, HIGH);
+    delay(200);
+    digitalWrite(ledPin, LOW);
+    delay(200);
+  }
+  digitalWrite(ledPin, HIGH);
+  delay(600);
+  digitalWrite(ledPin, LOW);
 }
 
 void loop() {
   measureSensor();
   long timeNow = millis();
 
-  Serial.print(">sensor:");
-  Serial.println(sensorValue);
+  // Serial.print(">sensor:");
+  // Serial.println(sensorValue);
 
-  Serial.print(">max:");
-  Serial.println(sensorMax);
+  // Serial.print(">max:");
+  // Serial.println(sensorMax);
 
-  Serial.print(">max_slope:");
-  Serial.println(sensorMaxSlope);
-
-  Serial.print(">slope:");
-  Serial.println(sensorSlope);
-  
-  Serial.print(">status:");
-  Serial.println(ledOn);
+  // Serial.print(">status:");
+  // Serial.println(ledOn);
 
   // Serial.print(sensorValue);
   // Serial.print(',');
@@ -148,54 +134,55 @@ void loop() {
   // Serial.println(digitalRead(ledPin));
 
   static bool calibrating = false;
-  static long newSensorMax = 0, newSensorMaxSlope = 0;
-  if(calibrating){
+  static long newSensorMax = 0;
+  if(calibrating || (timeNow - lastCalibrationTime)>=FORCE_CALIBRATION_TIME){
     if(sensorValue > newSensorMax){
       newSensorMax = sensorValue;
     }
-    if(sensorSlope > newSensorMaxSlope){
-      newSensorMaxSlope = sensorSlope;
-    }
     
-    if((timeNow-lastCalibration) > CALIBRATION_DURATION){
+    if((timeNow-lastCalibrationTime) > CALIBRATION_DURATION){
       if(newSensorMax > 1.2*sensorMax){
         sensorMax = 1.2*sensorMax;
       }else{
         sensorMax = newSensorMax;
       }
-
-      if(newSensorMaxSlope > 4*sensorMaxSlope){
-        sensorMaxSlope = 4*sensorMaxSlope;
-      }else{
-        sensorMaxSlope = newSensorMaxSlope;
-      }
-      
-      if(sensorMaxSlope < LOWER_SENSOR_MAX_SLOPE){
-        sensorMaxSlope = LOWER_SENSOR_MAX_SLOPE;
-      }
-
+      if(sensorMax==0) sensorMax = 1;
+      sensorHighValue = HIGH_SENSOR_MULTIPLE*sensorMax;
+    
       calibrating = false;
-      Serial.println("Calibrated");
+      lastCalibrationTime = timeNow;
+      // Serial.println("Calibrated");
     }
   }
 
-  // When pressed, the slope tends to be this big!
-  if(sensorSlope > sensorMaxSlope*4 || sensorSlope < -sensorMaxSlope*4){ // TODO
+  // If the button is being clicked...
+  if(clicking){
+    // When keeping pressed, it disables the calibration process.
     calibrating = false;
-    lastCalibration = timeNow;
+    
+    // When the sensor value crosses the low threshold (sensorMax) for a certain time, it may be considered that
+    // the button has been released. As the input is really noisy, it has to detect that threshold crossing for a 
+    // fet milliseconds.
+    if(sensorValue < sensorHighValue){
+      if(releasing){
+        if((timeNow-lastReleasingTime) >= RELEASE_DURATION){
+          clicking = false;
+          releasing = false;
+          lastSwitchTime = timeNow;
+          // Serial.println("Released");
+        }
+      }else{  // Starting the releasing...
+        // Serial.println("Releasing...");
+        releasing = true;
+        lastReleasingTime = timeNow;
+      }
+    }else{ // A higher value has been detected, so must be a noisy signal what it had previously detected.
+      releasing = false;
+    }
   }
 
-  // When the derivative crosses zero means a peak has been reached (button released).
-  if(clicking && sensorSlope<0){
-    Serial.println("Released");
-    clicking = false;
-    lastSwitch = timeNow;
-  }
-
+  // When changing modes it plays a little animation to signal the change :).
   if(changeModeNow){
-    static uint8_t animationIndex = 0;
-    static long nextAnimationTime = 0;
-
     // To signal mode change.
     if(timeNow > nextAnimationTime){
       switch (animationIndex) {
@@ -220,61 +207,61 @@ void loop() {
         break;
 
       case 4:{
-        int pos = (int) ledMode;
-        pos++;
-        pos %= MAX_LED_MODES;
-        ledMode = (LedMode) pos;
-        Serial.print("New mode: ");
-        Serial.println(pos);
+        ledMode++;
+        ledMode %= MAX_LED_MODES;
+        // Serial.print("New mode: ");
+        // Serial.println(ledMode);
 
-        animationIndex = 0xFF;
         changeModeNow = false;
+
+        // Long press should not turn off the device.
+        ledOn = true;
       }
       }
       animationIndex++;
     }
   }
 
-  if((timeNow-lastSwitch) >= 3000) {
-    // Inital click
-    if(!clicking && sensorSlope > 6*sensorMaxSlope){
-      Serial.println("Click");
-      ledOn = !ledOn;
-      if(!ledOn) digitalWrite(ledPin, LOW);
+  if((timeNow-lastSwitchTime) >= LONG_CLICK_DURATION) {
+    if(sensorValue > sensorHighValue){
+      if(clicking){
+        // Serial.println("Long click!");
+        changeModeNow = true;
+        nextAnimationTime = timeNow;
+        animationIndex = 0;
+      }else{
+        // Serial.println("Click"); // Initial click
+        ledOn = !ledOn;
+        digitalWrite(ledPin, ledOn);
+
+        clicking = true;
+      }
+
+      lastSwitchTime = timeNow;
 
       // Disable the calibration while pushing.
-      lastCalibration = timeNow+3000;
       calibrating = false;
-      lastSwitch = timeNow;
-      clicking = true;
-    }
-    
-    //Long click
-    if(clicking && sensorValue > 2*sensorMax){
-      changeModeNow = true;
-      lastSwitch = timeNow;
     }
   }
   
-  if(ledOn && (timeNow-lastSwitch)>=AUTO_TURN_OFF_TIMEOUT){
-    Serial.println("Off");
+  if(ledOn && (timeNow-lastSwitchTime)>=AUTO_TURN_OFF_TIMEOUT){
+    // Serial.println("Off");
     ledOn = false;
     digitalWrite(ledPin, LOW);
   }
   
-  if((timeNow-lastCalibration)>=CALIBRATION_INTERVAL){
+  if(!calibrating && (timeNow-lastCalibrationTime)>=CALIBRATION_INTERVAL){
     calibrating = true;
     // Restart substitutes.
     newSensorMax = 0;
-    newSensorMaxSlope = 0;
-    Serial.println("Calibrating...");
-    lastCalibration = timeNow;
+    // Serial.println("Calibrating...");
+    lastCalibrationTime = timeNow;
   }
 
   if(!ledOn || changeModeNow) return;
 
   switch (ledMode){
-  case SINE_FAST:{
+  case LED_SINE_FAST:{
     uint8_t output = 127*(1.0+sin(TWO_PI*timeNow/2000.0));
     analogWrite(ledPin, output);
     // Serial.print(">sin:");
@@ -282,17 +269,16 @@ void loop() {
     break;
   }
   
-  case SINE_SLOW:{
+  case LED_SINE_SLOW:{
     uint8_t output = 127*(1.0+sin(TWO_PI*timeNow/10000.0));
     analogWrite(ledPin, output);
     break;
   }
 
-  case STATIC:
+  case LED_STATIC:
   default:
     digitalWrite(ledPin, HIGH);
   break;
   }
 
-  if(timeNow > 86400000) resetFunc(); // Reset Arduino every day
 }
